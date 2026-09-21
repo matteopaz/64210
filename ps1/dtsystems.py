@@ -338,7 +338,17 @@ def feedback_composition(a: System, b: System) -> Diagram:
     Feedback composition of two systems.
     Takes in two systems, and returns a Diagram.
     """
-    raise NotImplementedError("your code here")
+
+    builder = DiagramBuilder()
+    a_sys = builder.AddSystem(a)
+    b_sys = builder.AddSystem(b)
+    builder.Connect(a_sys.get_output_port(), b_sys.get_input_port())
+    builder.Connect(b_sys.get_output_port(), a_sys.get_input_port())
+    for s in (a_sys, b_sys):
+        logger = LogVectorOutput(s.get_output_port(), builder)
+        logger.set_name(f"log_{s.get_name()}")
+    return builder.Build()
+    
 
 
 def Body1D(mass: float = 1, dt: float = 1) -> DTVectorSystem:
@@ -347,7 +357,21 @@ def Body1D(mass: float = 1, dt: float = 1) -> DTVectorSystem:
     position is output.
     Takes in mass and dt, and returns a DTVectorSystem.
     """
-    raise NotImplementedError("your code here")
+
+    def next_state(s, inp):
+        force = np.asarray(inp).reshape(-1)[0]
+        return np.array([s[0] + s[1] * dt, s[1] + force / mass * dt])
+
+    return DTVectorSystem(
+        1,
+        2,
+        1,
+        next_state,
+        lambda s, inp: np.array([s[0]]),
+        input_port_name="force",
+        dt=dt,
+        name="Body1D",
+    )
 
 
 def PController(dim: int, set_point: ArrayLike, gain: float = 1) -> DTVectorSystem:
@@ -357,7 +381,15 @@ def PController(dim: int, set_point: ArrayLike, gain: float = 1) -> DTVectorSyst
     Takes in the dimension, the set point, and the gain, and returns a
     stateless DTVectorSystem.
     """
-    raise NotImplementedError("your code here")
+    return DTVectorSystem(
+        dim,
+        0,
+        dim,
+        lambda s, inp: inp,
+        lambda s, inp: gain * (np.asarray(set_point) - inp),
+        output_depends_on_input=True,
+        name="PController",
+    )
 
 
 def Observer(d_in: int, indices: Sequence[int]) -> DTVectorSystem:
@@ -367,7 +399,20 @@ def Observer(d_in: int, indices: Sequence[int]) -> DTVectorSystem:
     Takes in the input dimension and the indices to keep, and returns a
     stateless DTVectorSystem.
     """
-    raise NotImplementedError("your code here")
+    idxs = np.asarray(indices, dtype=int)
+
+    def output_fun(_s, inp):
+        return np.asarray(inp)[idxs]
+
+    return DTVectorSystem(
+        d_in,
+        0,
+        len(idxs),
+        lambda s, inp: s,
+        output_fun,
+        output_depends_on_input=True,
+        name="Observer",
+    )
 
 
 def SimpleTrajectoryFollower(
@@ -379,7 +424,32 @@ def SimpleTrajectoryFollower(
     keeps track of which waypoint that is; once the input is within epsilon of
     it, move on to the next.
     """
-    raise NotImplementedError("your code here")
+    wps = [np.asarray(w, dtype=float) for w in waypoints]
+    n = len(wps)
+    dim = len(wps[0])
+
+    def current_index(s) -> int:
+        i = int(np.rint(np.asarray(s).reshape(-1)[0]))
+        return max(0, min(i, n - 1))
+
+    def next_state(s, inp):
+        i = current_index(s)
+        if np.linalg.norm(np.asarray(inp) - wps[i]) < epsilon and i < n - 1:
+            i += 1
+        return np.array([float(i)])
+
+    def output_fun(s, _inp):
+        return wps[current_index(s)]
+
+    return DTVectorSystem(
+        dim,
+        1,
+        dim,
+        next_state,
+        output_fun,
+        dt=dt,
+        name="SimpleTrajectoryFollower",
+    )
 
 
 def PController2(dim: int, gain: float = 1) -> DTVectorSystem:
@@ -387,7 +457,16 @@ def PController2(dim: int, gain: float = 1) -> DTVectorSystem:
     Like PController, but with two input ports, "target" and "actual"; the
     output is gain * (target - actual).
     """
-    raise NotImplementedError("your code here")
+    return DTVectorSystem(
+        [dim, dim],
+        0,
+        dim,
+        lambda s, inp: s,
+        lambda s, inp: gain * (inp[0] - inp[1]),
+        output_depends_on_input=True,
+        input_port_name=["target", "actual"],
+        name="PController2",
+    )
 
 
 ######################################################################
@@ -398,6 +477,27 @@ def main0_without_logging(init_val: float = 0) -> None:
     system = Counter(2, verbose=True)
     s0 = [[init_val]]
     simulate(system, s0, T=5)
+
+def main7_2() -> None:
+    """
+    Series-compose a constant 0.1 N force with Body1D (mass 2 kg, dt 0.1 s)
+    and simulate for 0.5 s from rest at the origin.
+    """
+    force = Constant([0.1])
+    body = Body1D(mass=2, dt=0.1)
+    diagram = series_composition(force, body)
+    if not HEADLESS:
+        plt.figure(figsize=(12, 6))
+        plot_system_graphviz(diagram)
+        plt.show()
+
+    s0 = [[0.0, 0.0]]
+    simulator = simulate(diagram, s0, T=0.5)
+    final = get_state(body, simulator)
+    print(f"   Final position: {final[0]}")
+    print(f"   Final velocity: {final[1]}")
+    plot_log(diagram, simulator, "log_Body1D")
+
 
 def main0(init_val: float = 0) -> None:
     """

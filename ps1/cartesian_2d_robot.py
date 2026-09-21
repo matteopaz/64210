@@ -49,7 +49,7 @@ TABLE_TOP_Z = 0.05
 FINGER_CLEARANCE = 0.001
 FINGER_Z = TABLE_TOP_Z + FINGER_HEIGHT / 2 + FINGER_CLEARANCE
 
-JOINT_DAMPING = 10.0
+JOINT_DAMPING = 20.0
 
 # Solid-cylinder inertia about its center of mass.
 _IXX = FINGER_MASS * (3 * FINGER_RADIUS**2 + FINGER_HEIGHT**2) / 12
@@ -228,7 +228,29 @@ def create_2d_robot_diagram_with_controller(
     given gain and target q_desired, wired from the plant's state output back
     into its actuation input.
     """
-    raise NotImplementedError("your code here")
+    builder = DiagramBuilder()
+    plant, scene_graph = AddMultibodyPlantSceneGraph(builder, time_step=TIME_STEP)
+    parser = Parser(plant)
+    parser.AddModelsFromString(table_sdf, "sdf")
+    parser.AddModelsFromString(finger_sdf, "sdf")
+    plant.Finalize()
+
+    # Plant state is [x, y, xdot, ydot]; the P controller only wants [x, y].
+    observer = Observer(4, [0, 1])
+    controller = PController(2, q_desired, controller_gain)
+    control = builder.AddSystem(series_composition(observer, controller))
+    builder.Connect(plant.get_state_output_port(), control.get_input_port())
+    builder.Connect(control.get_output_port(), plant.get_actuation_input_port())
+
+    if meshcat is not None:
+        MeshcatVisualizer.AddToBuilder(builder, scene_graph, meshcat)
+
+    logger = LogVectorOutput(plant.get_state_output_port(), builder)
+    logger.set_name("log_plant")
+
+    diagram = builder.Build()
+    diagram.set_name("plant and scene_graph")
+    return diagram, plant
 
 
 def create_2d_robot_diagram_with_waypoints(
@@ -243,7 +265,34 @@ def create_2d_robot_diagram_with_waypoints(
     output is the target for a PController2 with the given gain, whose output
     drives the plant's actuation input.
     """
-    raise NotImplementedError("your code here")
+    builder = DiagramBuilder()
+    plant, scene_graph = AddMultibodyPlantSceneGraph(builder, time_step=TIME_STEP)
+    parser = Parser(plant)
+    parser.AddModelsFromString(table_sdf, "sdf")
+    parser.AddModelsFromString(finger_sdf, "sdf")
+    plant.Finalize()
+
+    observer = builder.AddSystem(Observer(4, [0, 1]))
+    follower = builder.AddSystem(SimpleTrajectoryFollower(waypoints, epsilon))
+    controller = builder.AddSystem(PController2(2, controller_gain))
+
+    builder.Connect(plant.get_state_output_port(), observer.get_input_port())
+    builder.Connect(observer.get_output_port(), follower.get_input_port())
+    builder.Connect(follower.get_output_port(), controller.GetInputPort("target"))
+    builder.Connect(observer.get_output_port(), controller.GetInputPort("actual"))
+    builder.Connect(controller.get_output_port(), plant.get_actuation_input_port())
+
+    if meshcat is not None:
+        MeshcatVisualizer.AddToBuilder(builder, scene_graph, meshcat)
+
+    logger = LogVectorOutput(plant.get_state_output_port(), builder)
+    logger.set_name("log_plant")
+    log_follower = LogVectorOutput(follower.get_output_port(), builder)
+    log_follower.set_name("log_follower")
+
+    diagram = builder.Build()
+    diagram.set_name("plant and scene_graph")
+    return diagram, plant
 
 
 ######################################################################
@@ -251,5 +300,61 @@ def create_2d_robot_diagram_with_waypoints(
 ######################################################################
 
 
+def test_position_controller(
+    q_desired: ArrayLike = (0.9, 0.6), gain: float = 100, T: float = 5.0
+) -> None:
+    """
+    Drive the finger from FINGER_START to q_desired with a P controller.
+    """
+    meshcat = get_meshcat()
+    q_desired = np.asarray(q_desired, dtype=float)
+    diagram, plant = create_2d_robot_diagram_with_controller(
+        controller_gain=gain, q_desired=q_desired, meshcat=meshcat
+    )
+    simulator = simulate(diagram, finger_s0(FINGER_START), T)
+    q_final = get_positions(plant, simulator)
+    print(f"   Initial finger position: {FINGER_START}")
+    print(f"   Target finger position:  {q_desired}")
+    print(f"   Final finger position:   {q_final}")
+
+    log_plant = diagram.GetSubsystemByName("log_plant")
+    log = log_plant.FindLog(simulator.get_context())
+    times = log.sample_times()
+    data = log.data()
+    pos_err = np.linalg.norm(data[:2] - q_desired[:, None], axis=0)
+    speed = np.linalg.norm(data[2:4], axis=0)
+    at_rest = (pos_err < 1e-3) & (speed < 1e-3)
+    if np.any(at_rest):
+        # First time after which the finger stays at the target.
+        still_moving = np.where(~at_rest)[0]
+        t_rest = times[0] if still_moving.size == 0 else times[still_moving[-1] + 1]
+        print(f"   Time to rest at target:  {t_rest:.4f} s")
+    else:
+        print("   Finger did not come to rest at the target within T.")
+
+    plt.figure(figsize=(8, 4))
+    plt.plot(times, data[0], label="x")
+    plt.plot(times, data[1], label="y")
+    plt.axhline(q_desired[0], color="C0", linestyle="--", linewidth=1, label="x desired")
+    plt.axhline(q_desired[1], color="C1", linestyle="--", linewidth=1, label="y desired")
+    plt.xlabel("time (s)")
+    plt.ylabel("position (m)")
+    plt.title("finger position")
+    plt.legend()
+    plt.grid(True)
+    plt.tight_layout()
+    png_path = __file__.replace("cartesian_2d_robot.py", "finger_position.png")
+    plt.savefig(png_path, dpi=150)
+    print(f"   Saved position plot:     {png_path}")
+    plt.close()
+    if meshcat is not None:
+        html_path = __file__.replace("cartesian_2d_robot.py", "finger_position_meshcat.html")
+        with open(html_path, "w", encoding="utf-8") as f:
+            f.write(meshcat.StaticHtml())
+        print(f"   Saved meshcat recording: {html_path}")
+        print(f"   Meshcat URL:             {meshcat.web_url()}")
+    show_meshcat()
+
+
 if __name__ == "__main__":
-    test_const_input([4.0, 1.0])
+    test_position_controller()

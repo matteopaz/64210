@@ -132,6 +132,24 @@ def test_const_torque(q_initial: np.ndarray, torques: np.ndarray) -> None:
 ######################################################################
 
 
+def _iiwa_plant(builder: DiagramBuilder):
+    """
+    Welded-base iiwa14 plant plus its scene graph, matching create_IIWA14_diagram.
+    """
+    plant, scene_graph = AddMultibodyPlantSceneGraph(builder, time_step=1e-4)
+    parser = Parser(plant, scene_graph)
+    try:
+        parser.AddModelsFromUrl(IIWA14_URL)
+    except RuntimeError as e:
+        # The first load downloads the models; this explains the one common
+        # way that fails (a space or such in the venv's path) before re-raising.
+        explain_model_download_error(e)
+        raise
+    plant.WeldFrames(plant.world_frame(), plant.GetFrameByName("iiwa_link_0"))
+    plant.Finalize()
+    return plant, scene_graph
+
+
 def create_IIWA14_diagram_with_pcontroller(
     controller_gain: float, q_desired: np.ndarray, meshcat: Meshcat | None = None
 ) -> tuple[Diagram, MultibodyPlant]:
@@ -142,7 +160,24 @@ def create_IIWA14_diagram_with_pcontroller(
     target q_desired, wired from the plant's state output back into its
     actuation input.
     """
-    raise NotImplementedError("your code here")
+    builder = DiagramBuilder()
+    plant, scene_graph = _iiwa_plant(builder)
+
+    observer = Observer(14, list(range(plant.num_positions())))
+    controller = PController(7, q_desired, controller_gain)
+    control = builder.AddSystem(series_composition(observer, controller))
+    builder.Connect(plant.get_state_output_port(), control.get_input_port())
+    builder.Connect(control.get_output_port(), plant.get_actuation_input_port())
+
+    if meshcat is not None:
+        MeshcatVisualizer.AddToBuilder(builder, scene_graph, meshcat)
+
+    logger = LogVectorOutput(plant.get_state_output_port(), builder)
+    logger.set_name("log_plant")
+
+    diagram = builder.Build()
+    diagram.set_name("plant and scene_graph")
+    return diagram, plant
 
 
 def create_IIWA14_diagram_with_pd_controller(
@@ -157,7 +192,52 @@ def create_IIWA14_diagram_with_pd_controller(
     defined in dtsystems.py: controller_gain, damping_gain, and dt go through
     to it.
     """
-    raise NotImplementedError("your code here")
+    builder = DiagramBuilder()
+    plant, scene_graph = _iiwa_plant(builder)
+
+    observer = Observer(14, list(range(plant.num_positions())))
+    controller = PDController(7, q_desired, controller_gain, damping_gain, dt)
+    control = builder.AddSystem(series_composition(observer, controller))
+    builder.Connect(plant.get_state_output_port(), control.get_input_port())
+    builder.Connect(control.get_output_port(), plant.get_actuation_input_port())
+
+    if meshcat is not None:
+        MeshcatVisualizer.AddToBuilder(builder, scene_graph, meshcat)
+
+    logger = LogVectorOutput(plant.get_state_output_port(), builder)
+    logger.set_name("log_plant")
+
+    diagram = builder.Build()
+    diagram.set_name("plant and scene_graph")
+    return diagram, plant
+
+
+def test_pdcontroller(
+    q_desired: np.ndarray,
+    controller_gain: float,
+    damping_gain: float,
+    dt: float,
+    q_initial: np.ndarray,
+) -> None:
+    """
+    Drive the arm from q_initial to q_desired with a PD controller.
+    """
+    meshcat = get_meshcat()
+    diagram, plant = create_IIWA14_diagram_with_pd_controller(
+        controller_gain=controller_gain,
+        damping_gain=damping_gain,
+        q_desired=q_desired,
+        dt=dt,
+        meshcat=meshcat,
+    )
+    # Plant discrete state is [q, v]; PDController's is the previous measured q.
+    simulator = simulate(diagram, iiwa_s0(q_initial) + [q_initial], 5.0)
+    plot_log(diagram, simulator, "log_plant")
+    q_final = get_positions(plant, simulator)
+    print(f"   Initial joint positions: {q_initial}")
+    print(f"   Target joint positions:  {q_desired}")
+    print(f"   Final joint positions:   {q_final}")
+    show_meshcat()
 
 
 def create_IIWA14_diagram_with_waypoints(
@@ -165,6 +245,7 @@ def create_IIWA14_diagram_with_waypoints(
     controller_gain: float = 10000,
     damping_gain: float = 3000,
     epsilon: float = 0.01,
+    dt: float = 0.01,
     meshcat: Meshcat | None = None,
 ) -> tuple[Diagram, MultibodyPlant]:
     """
@@ -177,8 +258,84 @@ def create_IIWA14_diagram_with_waypoints(
     waypoint, so this controller must be stiff enough that its gravity sag
     stays well under epsilon.
     """
-    raise NotImplementedError("your code here")
+    builder = DiagramBuilder()
+    plant, scene_graph = _iiwa_plant(builder)
+
+    nq = plant.num_positions()
+    observer = builder.AddSystem(Observer(14, list(range(nq))))
+    follower = builder.AddSystem(SimpleTrajectoryFollower(waypoints, epsilon))
+    controller = builder.AddSystem(
+        PDController2(nq, controller_gain, damping_gain, dt)
+    )
+
+    builder.Connect(plant.get_state_output_port(), observer.get_input_port())
+    builder.Connect(observer.get_output_port(), follower.get_input_port())
+    builder.Connect(follower.get_output_port(), controller.GetInputPort("target"))
+    builder.Connect(observer.get_output_port(), controller.GetInputPort("actual"))
+    builder.Connect(controller.get_output_port(), plant.get_actuation_input_port())
+
+    if meshcat is not None:
+        MeshcatVisualizer.AddToBuilder(builder, scene_graph, meshcat)
+
+    logger = LogVectorOutput(plant.get_state_output_port(), builder)
+    logger.set_name("log_plant")
+    log_follower = LogVectorOutput(follower.get_output_port(), builder)
+    log_follower.set_name("log_follower")
+
+    diagram = builder.Build()
+    diagram.set_name("plant and scene_graph")
+    return diagram, plant
+
+
+def test_square_iiwa(
+    waypoints: list[np.ndarray] | None = None,
+    controller_gain: float = 10000,
+    damping_gain: float = 3000,
+    epsilon: float = 0.01,
+    T: float = 5.0,
+) -> None:
+    """
+    Draw SQUARE_IIWA: start at the first joint-space corner and chase the rest
+    with the PD waypoint follower.
+    """
+    if waypoints is None:
+        waypoints = SQUARE_IIWA
+    meshcat = get_meshcat()
+    if meshcat is not None:
+        # Look at the workspace in front of the base, where the 0.4 m square lives.
+        meshcat.SetCameraPose(
+            np.array([1.15, -0.75, 0.55]),
+            np.array([0.45, 0.0, 0.75]),
+        )
+    diagram, plant = create_IIWA14_diagram_with_waypoints(
+        waypoints=waypoints,
+        controller_gain=controller_gain,
+        damping_gain=damping_gain,
+        epsilon=epsilon,
+        meshcat=meshcat,
+    )
+    q0 = waypoints[0]
+    # Plant discrete state is [q, v]; follower index; PDController2's previous q.
+    simulator = simulate(diagram, iiwa_s0(q0) + [[0.0], q0], T)
+    plot_log(diagram, simulator, "log_plant")
+    q_final = get_positions(plant, simulator)
+    print(f"   Initial joint positions: {q0}")
+    print(f"   Final joint positions:   {q_final}")
+    print(f"   Last waypoint:           {waypoints[-1]}")
+    print(f"   Error to last waypoint:  {np.linalg.norm(q_final - waypoints[-1]):.4f}")
+    if meshcat is not None:
+        html_path = __file__.replace("iiwa_1.py", "iiwa_square_meshcat.html")
+        with open(html_path, "w", encoding="utf-8") as f:
+            f.write(meshcat.StaticHtml())
+        print(f"   Saved meshcat recording: {html_path}")
+        print(f"   Meshcat URL:             {meshcat.web_url()}")
+    show_meshcat()
 
 
 if __name__ == "__main__":
-    test_const_torque(Q_START, np.zeros(7))     # zero torque
+    test_square_iiwa()
+    from utils.viz import keep_meshcat_open
+
+    keep_meshcat_open()
+
+
