@@ -1,0 +1,9 @@
+[project]
+name = "mit-64210"
+version = "0.0.0"
+description = "6.4210/6.4212 Robotic Manipulation local environment"
+requires-python = ">=3.13"
+dependencies = [
+    "drake",
+    "manipulation",
+]

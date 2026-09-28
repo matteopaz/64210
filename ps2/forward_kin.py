@@ -125,17 +125,32 @@ X_WC = X2D(6, 4, -np.pi * 2 / 3)
 # Use Drake tools!
 def forward_kinematics(q: np.ndarray) -> np.ndarray:
     """Position of the two-link arm's end-effector frame C in base frame a."""
-    raise NotImplementedError("your code here")
+    j0 = X2D(0,0,q[0])
+    l0 = X2D(1,0,0)
+    j1 = X2D(0,0,q[1])
+    l1 = X2D(1,0,0)
+    X_C = j0 @ l0 @ j1 @ l1
+    return X2p(X_C)
 
 
 def inverse_kinematics(x: float, y: float) -> tuple[np.ndarray, np.ndarray]:
     """The two joint configurations that put the end effector at (x, y)."""
-    raise NotImplementedError("your code here")
-
+    solns = []
+    for sgn in [-1, 1]:
+        q1 = sgn*np.arccos(0.5*(x**2 + y**2 - 2))
+        q0 = np.arctan2(y, x) - np.arctan2(np.sin(q1), 1+np.cos(q1))
+        solns.append(np.array([q0, q1]))
+    return solns
 
 def Jacobian(q: np.ndarray) -> np.ndarray:
     """The 2 x 2 translational Jacobian of the two-link arm at q."""
-    raise NotImplementedError("your code here")
+    a = q[0]
+    b = q[1]
+    j00 = - np.sin(a) - np.sin(a+b)
+    j01 = - np.sin(a+b)
+    j10 = np.cos(a) + np.cos(a+b)
+    j11 = np.cos(a+b)
+    return np.array([[j00, j01], [j10, j11]])
 
 
 def manipulability(J):
@@ -148,4 +163,5 @@ if __name__ == "__main__":
     # test_plot_ik()
     # test_plot_manipulability()
     # test_plot_manipulability_task_space()
+    
     plt.show()

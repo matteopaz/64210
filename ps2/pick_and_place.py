@@ -458,12 +458,21 @@ def make_overhead_box_grasp() -> RigidTransform:
     The constants above describe the block dimensions, the gripper opening, and
     how far the middle of the finger pads sits from frame G.
     """
-    raise NotImplementedError("your code here")
+    roll = RotationMatrix.MakeXRotation(-np.pi/2)
+    pitch = RotationMatrix.MakeYRotation(np.pi/2)
+    yaw = RotationMatrix.MakeZRotation(np.pi)
+    R_OG = yaw @ roll @ pitch
+    # O is the center of the block's bottom face, so the pads have to reach
+    # half a block higher than that to close on the middle of it.
+    return RigidTransform(R_OG, [0, 0, GRIPPER_REACH + BLOCK_SIZE[2] / 2])
 
 
 def target_conf_to_pick(block_name) -> np.ndarray:
     """Arm joint angles that put the open gripper around the red block."""
-    raise NotImplementedError("your code here")
+    bp = block_pose(block_name)
+    X_OG = make_overhead_box_grasp()
+    X_WG = bp @ X_OG
+    return inv_kin(X_WG)
 
 
 ## ---- test3: a timed trajectory, and following it ------------------
@@ -492,7 +501,15 @@ def timed_trajectories(waypoints, X_WG_start, speed: float):
     the fingers have a controller of their own, and what we owe them is a width
     to go to, held from the moment the plan asks for it.
     """
-    raise NotImplementedError("your code here")
+
+    stops = trajectory_stops(waypoints, X_WG_start)
+    times = waypoint_times(stops, speed)
+    X_G = PiecewisePose.MakeLinear(times, [stop.X_WG for stop in stops])
+    V_G = X_G.MakeDerivative()
+    wsg = PiecewisePolynomial.ZeroOrderHold(
+        times, np.array([[stop.opening for stop in stops]])
+    )
+    return V_G, wsg
 
 
 def JointVelocity(plant):
@@ -520,7 +537,10 @@ def JointVelocity(plant):
             plant_context, JacobianWrtVariable.kV, G, [0, 0, 0], W, W
         )
 
-        raise NotImplementedError("your code here")
+        J_G_arm = J_G[:, arm_columns]
+        J_G_arm_pinv = np.linalg.pinv(J_G_arm)
+        v = J_G_arm_pinv @ V_WG
+        return v
 
     return DTSystem(
         [6, 7],
@@ -541,7 +561,34 @@ def compose_jacobian_control(waypoints, speed):
     together: the trajectory is built in here, and it is the only thing that
     knows when it ends.
     """
-    raise NotImplementedError("your code here")
+    builder = DiagramBuilder()
+    station = builder.AddNamedSystem(
+        "station", MakeHardwareStation(make_scenario(), meshcat=get_meshcat())
+    )
+    plant = station.GetSubsystemByName("plant")
+    add_all_triads(station)
+    start_the_fingers_open(plant)
+
+    gripper = plant.GetBodyByName("body", plant.GetModelInstanceByName("wsg"))
+    X_WG_start = plant.EvalBodyPoseInWorld(plant.CreateDefaultContext(), gripper)
+    V_G, wsg = timed_trajectories(waypoints, X_WG_start, speed)
+
+    gripper_velocity = builder.AddNamedSystem("GripperVelocity", TrajectorySource(V_G))
+    finger_command = builder.AddNamedSystem("FingerCommand", TrajectorySource(wsg))
+    joint_velocity = builder.AddSystem(JointVelocity(plant))
+    integrator = builder.AddNamedSystem(JOINT_INTEGRATOR, Integrator(7))
+
+    builder.Connect(
+        gripper_velocity.get_output_port(), joint_velocity.GetInputPort("V_WG")
+    )
+    builder.Connect(
+        integrator.get_output_port(), joint_velocity.GetInputPort("iiwa.position")
+    )
+    builder.Connect(joint_velocity.get_output_port(), integrator.get_input_port())
+    builder.Connect(integrator.get_output_port(), station.GetInputPort("iiwa.position"))
+    builder.Connect(finger_command.get_output_port(), station.GetInputPort("wsg.position"))
+
+    return builder.Build(), V_G.end_time()
 
 
 ## ---- test4: walking a whole plan ----------------------------------
@@ -551,7 +598,141 @@ def plan(a, b, c):
     """Waypoints to stack b squarely on a, then stand c upright on b.
     Each waypoint includes a gripper pose and a finger opening.
     """
-    raise NotImplementedError("your code here")
+    sx, _, sz = BLOCK_SIZE
+    X_WA = block_pose(a)
+    R_WA = X_WA.rotation()
+    top_of_a = X_WA.translation() + [0, 0, sz]
+
+    # b sits on a with the same orientation, so its frame is a's, raised by a
+    # block height.  Turning it half a revolution about its vertical axis
+    # leaves the box in exactly the same place.
+    b_goals = [
+        RigidTransform(R_WA @ S, top_of_a) for S in (NO_TURN, HALF_TURN_ABOUT_Z)
+    ]
+
+    # c stands on end in the middle of b: its long x axis is vertical and its
+    # center sits half a block length above b's top.  Any quarter turn about
+    # the vertical, and any of the box's own symmetries, is the same result.
+    c_center = top_of_a + [0, 0, sz + sx / 2]
+    standing = R_WA @ RotationMatrix.MakeYRotation(-np.pi / 2)
+    c_goals = [
+        block_centered_at(
+            RotationMatrix.MakeZRotation(k * np.pi / 2) @ standing @ S, c_center
+        )
+        for k in range(4)
+        for S in BOX_SYMMETRIES
+    ]
+
+    R_WG = default_gripper_pose().rotation()
+    waypoints_b, R_WG = pick_and_place(block_pose(b), b_goals, R_WG)
+    waypoints_c, _ = pick_and_place(block_pose(c), c_goals, R_WG)
+    return waypoints_b + waypoints_c
+
+
+NO_TURN = RotationMatrix()
+HALF_TURN_ABOUT_Z = RotationMatrix.MakeZRotation(np.pi)
+BOX_SYMMETRIES = [
+    NO_TURN,
+    RotationMatrix.MakeXRotation(np.pi),
+    RotationMatrix.MakeYRotation(np.pi),
+    HALF_TURN_ABOUT_Z,
+]
+
+# How far above a grasp or a placement to pass on the way in and out.  High
+# enough that a carried block, even swinging upright, clears the stack.
+CLEARANCE = 0.15
+# How far to back the open fingers away from a block after letting go of it.
+RETREAT = 0.1
+
+
+def default_gripper_pose() -> RigidTransform:
+    """Where the gripper is in the scenario's starting configuration."""
+    plant = MakeMultibodyPlant(LoadScenario(data=ROBOT))
+    G = plant.GetBodyByName("body", plant.GetModelInstanceByName("wsg"))
+    return plant.EvalBodyPoseInWorld(plant.CreateDefaultContext(), G)
+
+
+def block_centered_at(R_WO: RotationMatrix, center) -> RigidTransform:
+    """The block frame that puts the middle of the box at `center`.
+
+    The frame is on the bottom face, not at the middle, so a rotation that
+    turns the box over also moves where its frame has to go.
+    """
+    return RigidTransform(R_WO, center - R_WO @ [0, 0, BLOCK_SIZE[2] / 2])
+
+
+def rotation_between(X_1: RigidTransform, X_2: RigidTransform) -> float:
+    return (X_1.rotation().inverse() @ X_2.rotation()).ToAngleAxis().angle()
+
+
+def reaches_outward(X_WG: RigidTransform) -> bool:
+    """Whether the fingers point down, or else away from the arm's base.
+
+    A side approach from any other direction has the arm folding back on
+    itself to get there.
+    """
+    approach = (X_WG.rotation() @ [0, 1, 0])[:2]
+    if np.linalg.norm(approach) < 1e-6:
+        return True
+    radial = X_WG.translation()[:2] / np.linalg.norm(X_WG.translation()[:2])
+    return approach @ radial >= 0.5 * np.linalg.norm(approach)
+
+
+def nearest(candidates, R_WG: RotationMatrix) -> RigidTransform:
+    """The gripper pose among `candidates` that turns the wrist least.
+
+    Every turn the plan does not need is one more the iiwa's last joint has to
+    find room for within its limits.
+    """
+    X = RigidTransform(R_WG, [0, 0, 0])
+    return min(
+        filter(reaches_outward, candidates), key=lambda Y: rotation_between(X, Y)
+    )
+
+
+def raised(X_WG: RigidTransform, height: float) -> RigidTransform:
+    return RigidTransform([0, 0, height]) @ X_WG
+
+
+def backed_off(X_WG: RigidTransform, distance: float) -> RigidTransform:
+    """The gripper moved back along the direction its fingers point, +y of G."""
+    return X_WG @ RigidTransform([0, -distance, 0])
+
+
+def pick_and_place(X_WO: RigidTransform, X_WO_goals, R_WG: RotationMatrix):
+    """Waypoints to carry the block at X_WO to one of the poses X_WO_goals.
+
+    `R_WG` is the gripper's orientation coming in; returns the waypoints and
+    the orientation going out.
+
+    A waypoint's opening is commanded from the moment the gripper gets there
+    until it gets to the next one, so closing or opening is followed by a
+    repeat of the same pose: a leg of standing still for the fingers to
+    finish before the arm moves off.
+    """
+    X_OG = make_overhead_box_grasp()
+    X_WG_grasp = nearest(
+        [X_WO @ RigidTransform(S) @ X_OG for S in (NO_TURN, HALF_TURN_ABOUT_Z)], R_WG
+    )
+    X_OG_held = X_WO.inverse() @ X_WG_grasp
+    X_WG_place = nearest(
+        [X_WO_goal @ X_OG_held for X_WO_goal in X_WO_goals], X_WG_grasp.rotation()
+    )
+    waypoints = [
+        Waypoint(raised(X_WG_grasp, CLEARANCE)),
+        Waypoint(X_WG_grasp, FINGER_CLOSED),
+        Waypoint(X_WG_grasp, FINGER_CLOSED),
+        Waypoint(raised(X_WG_grasp, CLEARANCE), FINGER_CLOSED),
+        Waypoint(raised(X_WG_place, CLEARANCE), FINGER_CLOSED),
+        Waypoint(X_WG_place, FINGER_OPEN),
+        Waypoint(X_WG_place, FINGER_OPEN),
+        Waypoint(backed_off(X_WG_place, RETREAT)),
+    ]
+    return waypoints, X_WG_place.rotation()
+
+
+
+
 
 
 ######################################################################
@@ -581,8 +762,8 @@ def test4(a="red", b="blue", c="yellow", speed=0.05):
 
 
 if __name__ == "__main__":
-    test1()
+    # test1()
     # test2("blue")
-    # test3("blue")
-    # test4()
+    # test3("red")/
+    test4()
     keep_meshcat_open()
